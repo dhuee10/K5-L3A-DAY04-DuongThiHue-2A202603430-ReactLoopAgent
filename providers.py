@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +13,52 @@ CONFIG = {
 }
 
 
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = int(os.getenv('PROVIDER_MAX_ATTEMPTS', '6'))
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    data = json.dumps(payload).encode()
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Rate limit / lỗi tạm thời của LLM provider: chờ theo Retry-After hoặc backoff rồi thử lại có giới hạn.
+            if exc.code in RETRY_STATUSES and attempt < MAX_ATTEMPTS:
+                try:
+                    wait = float(exc.headers.get('Retry-After') or 0)
+                except (TypeError, ValueError):
+                    wait = 0
+                exc.close()
+                time.sleep(min(max(wait, 5 * 2 ** (attempt - 1)), 90))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(5 * attempt)
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+        except TimeoutError as exc:
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(5 * attempt)
+                continue
+            raise RuntimeError('Provider timeout.') from exc
+
+
+def _fold_system_for_gemini(messages):
+    """Gemini OpenAI-compat trả 429 RESOURCE_EXHAUSTED (giả) với một số system prompt tiếng Việt;
+    cùng nội dung đặt trong user message thì chạy bình thường. Gộp system vào user message đầu tiên."""
+    system = '\n'.join(m['content'] for m in messages if m.get('role') == 'system' and m.get('content'))
+    rest = [m for m in messages if m.get('role') != 'system']
+    if not system:
+        return rest
+    wrapped = f'[System instructions]\n{system}\n[End system instructions]\n\n'
+    if rest and rest[0].get('role') == 'user' and isinstance(rest[0].get('content'), str):
+        return [{**rest[0], 'content': wrapped + rest[0]['content']}] + rest[1:]
+    return [{'role': 'user', 'content': wrapped.strip()}] + rest
 
 
 class Provider:
@@ -44,6 +81,8 @@ class Provider:
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
             return self._anthropic(messages, schemas)
+        if self.name == 'gemini':
+            messages = _fold_system_for_gemini(messages)
         payload = {'model': self.model, 'messages': messages}
         if schemas:
             payload['tools'] = schemas
